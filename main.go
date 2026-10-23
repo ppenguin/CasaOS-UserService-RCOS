@@ -26,6 +26,7 @@ import (
 	"github.com/ReCasaOS/CasaOS-UserService/pkg/utils/encryption"
 	"github.com/ReCasaOS/CasaOS-UserService/pkg/utils/random"
 	"github.com/ReCasaOS/CasaOS-UserService/route"
+	v1 "github.com/ReCasaOS/CasaOS-UserService/route/v1"
 	"github.com/ReCasaOS/CasaOS-UserService/service"
 	"github.com/coreos/go-systemd/daemon"
 	"go.uber.org/zap"
@@ -53,6 +54,7 @@ func init() {
 	resetUserFlag := flag.Bool("ru", false, "reset user")
 	userFlag := flag.String("user", "", "user name")
 	versionFlag := flag.Bool("v", false, "version")
+	bootstrapAdminFlag := flag.Bool("bootstrap-admin", false, "create the first administrator: username and password from $CREDENTIALS_DIRECTORY or two lines on stdin; once")
 
 	flag.Parse()
 
@@ -73,31 +75,54 @@ func init() {
 	}
 
 	sqliteDB := sqlite.GetDb(*dbFlag)
-	service.MyService = service.NewService(sqliteDB, config.CommonInfo.RuntimePath)
 
+	// the commands below need the account store only, not the gateway: they
+	// run (and end) on a box whose services are down
+	accounts := func() service.UserService {
+		return service.NewUserService(sqliteDB, filepath.Join(config.AppInfo.DBPath, service.KeyFilename))
+	}
+
+	if *bootstrapAdminFlag {
+		username, password, err := v1.ReadFirstAdminCredentials(os.Stdin)
+		if err == nil {
+			err = v1.CreateFirstAdmin(accounts(), username, password)
+		}
+		if err != nil {
+			fmt.Println("first administrator not created:", err)
+			os.Exit(1)
+		}
+		fmt.Println("first administrator created:", username)
+		os.Exit(0)
+	}
+
+	// -ru is a command: it ends the process, never goes on to start a second service
 	if *resetUserFlag {
+		users := accounts()
 		if userFlag == nil || len(*userFlag) == 0 {
 			fmt.Println("user is empty")
-			return
+			os.Exit(1)
 		}
 
-		userData := service.MyService.User().GetUserAllInfoByName(*userFlag)
+		userData := users.GetUserAllInfoByName(*userFlag)
 
 		if userData.Id == 0 {
 			fmt.Println("user not exist")
-			return
+			os.Exit(1)
 		}
 
 		password := random.RandomString(6, false)
 		userData.Password = encryption.HashPassword(password)
-		service.MyService.User().UpdateUserPassword(userData)
+		users.UpdateUserPassword(userData)
 		// The shell is the way back in when the authenticator and the recovery codes are both lost.
 		userData.TotpSecret, userData.TotpEnabled, userData.TotpLastStep, userData.RecoveryCodes = "", false, 0, nil
-		service.MyService.User().UpdateUserTOTP(userData)
+		users.UpdateUserTOTP(userData)
 		fmt.Println("User reset successful, two-factor authentication disabled")
 		fmt.Println("UserName:" + userData.Username)
 		fmt.Println("Password:" + password)
+		os.Exit(0)
 	}
+
+	service.MyService = service.NewService(sqliteDB, config.CommonInfo.RuntimePath)
 }
 
 func main() {
